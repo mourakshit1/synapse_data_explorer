@@ -1,0 +1,65 @@
+//The top level request
+GetRelevantTimeseriesData('3000000004')
+
+//Creates a function to joins data from SQL, ADT and ADX
+.create-or-alter function with (folder = "Analytics/IoT", skipvalidation = "true") GetRelevantTimeseriesData(purchaseOrder:string) {
+let productionOrder = GetProductionOrderData(purchaseOrder);
+let plantID = toscalar (productionOrder | project tostring(Plant_Code));
+let lineID = toscalar (productionOrder | project tostring(Mfg_Line));
+let productionDate = toscalar (productionOrder | project todatetime(Date));
+let startDate = productionDate - 24h;
+let endDate = productionDate + 24h;
+// Get twins of interest based on plantID and lineId
+GetTwins(plantID, lineID)
+| join kind=inner 
+( 
+    GetTelemetryData(startDate, endDate)
+) on Id
+| project-away tid, Id1
+}
+
+//Query a Synapse dedicated SQL pool
+.create-or-alter function with (folder = "Analytics/IoT", skipvalidation = "true") GetProductionOrderData(purchaseOrder:string) {
+let SQLquery = strcat(
+```
+declare @plantID VARCHAR(10)
+declare @plantProductionRecordViewName VARCHAR(50)
+declare @plantProductionRecordQuery nvarchar(100)
+declare @PO VARCHAR(20)
+set @PO = '```,purchaseOrder,```'
+-- get the plantID where the PO was fufilled
+set @plantID = (
+Select top (1) WERKS from PO 
+Where PO.EBELN = @PO)
+-- set the view name based on the plantID
+set @plantProductionRecordViewName = CONCAT('Plant',@plantID,'ProductionScheduleView')
+-- create query string to retrieve the production record of interest  
+set @plantProductionRecordQuery = CONCAT('select * from ',@plantProductionRecordViewName, ' where Purchase_Order = ', @PO)
+EXEC sp_executesql @plantProductionRecordQuery```);
+let productionOrder = materialize(
+    (evaluate sql_request( 
+        'Server=tcp:synapseadxdemo.sql.azuresynapse.net,1433;' 
+        'Authentication="Active Directory Integrated";' 
+        'Initial Catalog=SAPPOs;', SQLquery) ));
+productionOrder
+} 
+
+//Query Azure Digital Twins
+.create-or-alter function with (folder = "Analytics/IoT", skipvalidation = "true") GetTwins(plantID:string, lineID:string) {
+let ADTendpoint = "https://<name>.api.eus.digitaltwins.azure.net";
+let plantDtId = strcat('Plant', plantID);
+let ADTquery = strcat(```SELECT station.$dtId as tid FROM DIGITALTWINS plant
+JOIN prodLine RELATED plant.contains
+JOIN station related prodLine.contains
+WHERE plant.$dtId = '``` , plantDtId,
+"' AND prodLine.productionLineNumber = ", lineID);
+evaluate azure_digital_twins_query_request(ADTendpoint, ADTquery)
+| extend Id = tostring(tid)
+} 
+
+//Get the timeseries data from iot devices
+.create-or-alter function with (folder = "Analytics/IoT", skipvalidation = "true") GetTelemetryData(startDate:datetime, endDate:datetime) {
+TimeseriesData
+| where ts between (startDate..endDate)
+| project TimeStamp = ts, Id, ModelId, Key, Value = value, RelationshipTarget = "", RelationshipId = ""
+} 
